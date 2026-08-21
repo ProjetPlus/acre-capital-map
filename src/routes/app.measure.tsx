@@ -11,6 +11,7 @@ import {
   type CalibrationResult, type FieldValidation, type GpsConfig,
 } from "@/lib/gps";
 import { db, isBrowser } from "@/lib/db";
+import { syncEntity } from "@/lib/sync";
 import { prefetchTilesAround, keepScreenAwake } from "@/lib/offline";
 import { useAuth } from "@/lib/auth";
 import { formatArea, formatDistance } from "@/lib/format";
