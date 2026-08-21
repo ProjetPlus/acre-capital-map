@@ -11,6 +11,7 @@ import {
   type CalibrationResult, type FieldValidation, type GpsConfig,
 } from "@/lib/gps";
 import { db, isBrowser } from "@/lib/db";
+import { syncEntity } from "@/lib/sync";
 import { prefetchTilesAround, keepScreenAwake } from "@/lib/offline";
 import { useAuth } from "@/lib/auth";
 import { formatArea, formatDistance } from "@/lib/format";
@@ -40,7 +41,10 @@ function MeasurePage() {
     return db().parcelles.get(parcelleId);
   }, [parcelleId]);
 
+  // `running` = GPS actif (interface ouverte, position affichée)
+  // `started` = levée réellement démarrée (le tracé n'avance qu'à partir de là)
   const [running, setRunning] = useState(false);
+  const [started, setStarted] = useState(false);
   const [paused, setPaused] = useState(false);
   const [satellite, setSatellite] = useState(true);
   const [unit, setUnit] = useState<"ha" | "m2" | "km2">("ha");
@@ -75,10 +79,12 @@ function MeasurePage() {
   const stablePosRef = useRef<GpsPoint | null>(null);
   const watchRef = useRef<{ stop: () => void } | null>(null);
   const pausedRef = useRef(false);
+  const startedRef = useRef(false);
   const cfgRef = useRef<GpsConfig>(DEFAULT_GPS_CONFIG);
   const wakeRef = useRef<{ release: () => void } | null>(null);
   useEffect(() => () => { wakeRef.current?.release(); }, []);
   useEffect(() => { pausedRef.current = paused; }, [paused]);
+  useEffect(() => { startedRef.current = started; }, [started]);
   useEffect(() => { cfgRef.current = gpsConfig; }, [gpsConfig]);
 
   useEffect(() => {
@@ -96,6 +102,11 @@ function MeasurePage() {
         setRejectedCount((c) => c + 1);
       }
       setQaHistory((h) => [...h.slice(-29), { ts: raw.ts, acc: raw.accuracy, ok: accepted }]);
+      // La position affichée est toujours rafraîchie (pour pouvoir marquer le
+      // départ), mais aucun tracé n'est construit tant que la levée n'a pas
+      // été démarrée par l'opérateur.
+      if (accepted) setFilteredCur(filtered);
+      if (!startedRef.current) return;
       if (pausedRef.current) return;
       if (!accepted) return;
 
@@ -168,12 +179,15 @@ function MeasurePage() {
     }
   }
 
-  async function startGps() {
+  /** Ouvre simplement l'interface de levée : GPS actif, mais AUCUN tracé. */
+  async function openSurvey() {
     await unlockAudio();
     await requestNotificationPermission();
     stablePosRef.current = null;
     lastAutoRef.current = null;
     setTrace([]);
+    setPoints([]);
+    setStarted(false);
     setFilteredCur(null);
     setRunning(true);
     // Garde l'écran allumé pendant le levé (continuité du tracé)
@@ -225,6 +239,7 @@ function MeasurePage() {
       setError(`Précision insuffisante (±${src.accuracy.toFixed(0)} m, seuil calibré ${gpsConfig.maxAcceptableAccuracy} m). Attendez un meilleur signal.`);
       return;
     }
+    const isStart = !started;
     const p: MeasurementPoint = {
       index: points.length + 1,
       samples: 1,
@@ -234,7 +249,16 @@ function MeasurePage() {
       accuracy: src.accuracy,
       ts: Date.now(),
     };
-    setPoints((s) => [...s, p]);
+    if (isStart) {
+      // MARQUER LE DÉPART — c'est ce clic qui démarre réellement la levée.
+      stablePosRef.current = { lat: src.lat, lng: src.lng, accuracy: src.accuracy, ts: p.ts };
+      setTrace([{ lat: src.lat, lng: src.lng, accuracy: src.accuracy, ts: p.ts }]);
+      setPoints([p]);
+      setStarted(true);
+      notify("Levée démarrée", "Point de départ enregistré. Marchez autour de la parcelle.", { tag: "start" });
+    } else {
+      setPoints((s) => [...s, p]);
+    }
     lastAutoRef.current = { lat: p.lat, lng: p.lng, accuracy: p.accuracy, ts: p.ts };
     feedbackMark();
   }
@@ -257,20 +281,47 @@ function MeasurePage() {
     if (!res.ok) feedbackError();
   }
 
-  async function save(submit: boolean) {
+  /**
+   * Enregistre la levée. `force` permet de terminer à tout moment après le
+   * démarrage : le polygone est refermé automatiquement sur le point de départ
+   * à partir de la position actuelle.
+   */
+  async function save(submit: boolean, force = false) {
     if (!user) return;
     if (!isBrowser()) return;
-    const check = validateFieldMeasurement(points, {
+    // Fermeture automatique : la position courante est ajoutée comme dernier
+    // point si l'opérateur n'est pas revenu au point de départ.
+    const src = filteredCur ?? current;
+    let finalPoints = points;
+    if (force && src && points.length >= 1) {
+      const last = points[points.length - 1];
+      if (haversine(last, src) > 5) {
+        finalPoints = [...points, {
+          index: points.length + 1, samples: 1, auto: true,
+          lat: src.lat, lng: src.lng, accuracy: src.accuracy, ts: Date.now(),
+        }];
+      }
+    }
+    if (finalPoints.length < 3) {
+      feedbackError();
+      setError("Au moins 3 points sont nécessaires pour former une parcelle.");
+      return;
+    }
+    const finalTrace = force && finalPoints.length
+      ? [...trace, { lat: finalPoints[0].lat, lng: finalPoints[0].lng, accuracy: finalPoints[0].accuracy, ts: Date.now() }]
+      : trace;
+    const check = validateFieldMeasurement(finalPoints, {
       maxAcceptableAccuracyM: gpsConfig.maxAcceptableAccuracy,
       calibration,
       acceptedSamples: acceptedCount,
     });
-    if (!check.ok) {
+    if (!check.ok && !force) {
       setFieldCheck(check);
       setCheckOpen(true);
       feedbackError();
       return;
     }
+    const points_ = finalPoints;
     const accVals = accSamples.filter((a) => a < 999).sort((a, b) => a - b);
     const median = accVals[Math.floor(accVals.length / 2)] ?? bestAcc;
     const m: Measurement = {
@@ -279,9 +330,9 @@ function MeasurePage() {
       createdBy: user.id,
       createdAt: Date.now(),
       status: submit ? "submitted" : "draft",
-      points, trace,
-      areaM2: polygonAreaM2(points),
-      perimeterM: polygonPerimeterM(points),
+      points: points_, trace: finalTrace,
+      areaM2: polygonAreaM2(points_),
+      perimeterM: polygonPerimeterM(points_),
       unit,
       deviceProfile: {
         userAgent: navigator.userAgent, platform: navigator.platform,
@@ -318,6 +369,8 @@ function MeasurePage() {
       },
     };
     await db().measurements.put(m);
+    // Synchronisation cloud immédiate (ou mise en file d'attente hors ligne)
+    void syncEntity("measurements", m.id).catch(() => {});
     feedbackSuccess();
     setCheckOpen(false);
     if (submit) await notify("Mesure soumise", `Levé envoyé (${formatArea(m.areaM2, m.unit)}).`, { tag: "submit" });
@@ -390,12 +443,14 @@ function MeasurePage() {
         </button>
         {statsOpen && (
           <div className="bg-card/95 backdrop-blur shadow-elevated rounded-b-lg p-2 space-y-1 text-[11px]">
+            <Row label="État" value={!started ? "En attente du départ" : paused ? "En pause" : "Levée en cours"} />
             <Row label="Points" value={String(points.length)} />
-            <Row label="Périm." value={formatDistance(perim)} />
-            <Row label="Surface" value={formatArea(area, unit)} bold />
+            <Row label="Périm." value={points.length >= 2 ? formatDistance(perim) : "—"} />
+            <Row label="Surface" value={points.length >= 3 ? formatArea(area, unit) : "—"} bold />
+            <Row label="Précision" value={filteredCur ? `±${filteredCur.accuracy.toFixed(1)}m` : "—"} />
             <Row label="Méd." value={medianAcc != null ? `±${medianAcc.toFixed(1)}m` : "—"} />
             <Row label="Best" value={bestAcc < 999 ? `±${bestAcc.toFixed(1)}m` : "—"} />
-            {points.length > 0 && (
+            {started && points.length > 0 && (
               <Row label="Auto dans" value={`${Math.max(0, DEFAULT_GPS_CONFIG.autoMarkEveryMeters - distanceFromLast).toFixed(0)}m`} />
             )}
           </div>
@@ -458,19 +513,23 @@ function MeasurePage() {
             {error}
           </div>
         )}
-        <div className="flex gap-1.5 items-stretch">
+        <div className="flex flex-wrap gap-1.5 items-stretch">
           <button
             onClick={markPoint}
             disabled={!running || paused}
-            className="flex-1 h-14 rounded-2xl bg-accent text-accent-foreground font-bold shadow-elevated disabled:opacity-40 flex flex-col items-center justify-center gap-0.5"
+            className={`flex-1 min-w-[9rem] h-14 rounded-2xl font-bold shadow-elevated disabled:opacity-40 flex flex-col items-center justify-center gap-0.5 ${
+              started ? "bg-accent text-accent-foreground" : "bg-success text-white"
+            }`}
           >
             <MapPin className="w-5 h-5" />
-            <span className="text-[11px] leading-none">Marquer</span>
+            <span className="text-[11px] leading-none text-center px-1">
+              {started ? "MARQUER UN POINT" : "MARQUER LE DÉPART"}
+            </span>
           </button>
-          {running && (
+          {running && started && (
             <button
               onClick={togglePause}
-              className={`h-14 w-14 rounded-2xl shadow-elevated font-bold flex flex-col items-center justify-center gap-0.5 ${
+              className={`h-14 w-14 shrink-0 rounded-2xl shadow-elevated font-bold flex flex-col items-center justify-center gap-0.5 ${
                 paused ? "bg-success text-white" : "bg-warn text-white"
               }`}
             >
@@ -481,51 +540,52 @@ function MeasurePage() {
           <button
             onClick={undo}
             disabled={points.length === 0}
-            className="h-14 w-14 rounded-2xl bg-card shadow-elevated disabled:opacity-30 flex items-center justify-center"
+            className="h-14 w-14 shrink-0 rounded-2xl bg-card shadow-elevated disabled:opacity-30 flex items-center justify-center"
           >
             <Undo2 className="w-5 h-5" />
           </button>
         </div>
-        <div className="flex gap-1.5">
+        <div className="flex flex-wrap gap-1.5">
           <button
-            onClick={() => save(false)}
-            disabled={points.length < 3}
-            className="flex-1 h-10 rounded-xl bg-card/95 backdrop-blur shadow-elevated text-xs font-semibold disabled:opacity-40 flex items-center justify-center gap-1.5"
+            onClick={() => save(false, true)}
+            disabled={!started}
+            className="flex-1 min-w-[7rem] h-11 rounded-xl bg-card/95 backdrop-blur shadow-elevated text-xs font-semibold disabled:opacity-40 flex items-center justify-center gap-1.5"
           >
             <Save className="w-3.5 h-3.5" />Brouillon
           </button>
           <button
             onClick={() => {
-              if (points.length < 3) return;
-              if (!confirm(`Terminer la levée ?\n${points.length} points · ${formatArea(area, unit)}\nLa mesure sera soumise pour validation.`)) return;
-              if (!qaReady && !confirm("Qualité GPS faible. Terminer quand même ?")) return;
-              save(true);
+              if (!started) return;
+              const n = points.length;
+              if (!confirm(`Terminer et sauvegarder la levée ?\n${n} point(s) · ${n >= 3 ? formatArea(area, unit) : "surface calculée à la fermeture"}\nLe polygone sera automatiquement refermé sur le point de départ.`)) return;
+              save(true, true);
             }}
-            disabled={points.length < 3}
-            className="flex-1 h-10 rounded-xl bg-destructive text-destructive-foreground font-bold text-xs shadow-elevated disabled:opacity-40 flex items-center justify-center gap-1.5"
+            disabled={!started}
+            className="flex-1 min-w-[9rem] h-11 rounded-xl bg-destructive text-destructive-foreground font-bold text-xs shadow-elevated disabled:opacity-40 flex items-center justify-center gap-1.5"
           >
-            <Send className="w-3.5 h-3.5" />TERMINER LA LEVÉE
+            <Send className="w-3.5 h-3.5" />TERMINER ET SAUVER
           </button>
         </div>
       </div>
 
       {/* OVERLAY DÉMARRAGE */}
       {!running && (
-        <div className="absolute inset-0 bg-background/85 backdrop-blur-sm flex items-center justify-center p-6 z-[1000]">
-          <div className="bg-card rounded-2xl p-6 max-w-md text-center shadow-elevated">
+        <div className="absolute inset-0 bg-background/85 backdrop-blur-sm flex items-center justify-center p-4 sm:p-6 z-[1000] overflow-y-auto">
+          <div className="bg-card rounded-2xl p-5 sm:p-6 w-full max-w-md text-center shadow-elevated">
             <h2 className="text-xl font-bold">Prêt pour la levée GPS</h2>
             <p className="text-sm text-muted-foreground mt-2">
-              Positionnez-vous au point de départ puis marchez autour de la parcelle.
-              Auto-marquage tous les 100&nbsp;m. Tant que vous êtes immobile, le tracé n'avance pas.
+              Ce bouton ouvre seulement l'interface : le GPS s'active et affiche votre position,
+              mais <strong>aucun tracé n'est enregistré</strong>. Placez-vous ensuite au point de
+              départ et appuyez sur « MARQUER LE DÉPART » pour lancer réellement la levée.
             </p>
             <div className="text-xs text-warn bg-warn/10 rounded-md p-2 mt-3">
               Bornage légal réalisé par un géomètre assermenté.
             </div>
             <button
-              onClick={startGps}
+              onClick={openSurvey}
               className="mt-5 w-full h-14 bg-primary text-primary-foreground rounded-xl font-bold text-base shadow-elevated"
             >
-              ▶ DÉMARRER LA LEVÉE
+              ▶ OUVRIR L'INTERFACE DE LEVÉE
             </button>
             <p className="text-[10px] text-muted-foreground mt-2">Active GPS, son et notifications</p>
           </div>

@@ -8,30 +8,43 @@ import {
 } from "@/lib/ci-admin";
 import { fileToDataUrl } from "@/lib/photo";
 import { feedbackSuccess } from "@/lib/feedback";
+import { syncEntity } from "@/lib/sync";
 
 export const Route = createFileRoute("/app/parcelles/new")({
   component: NewParcelleWizard,
-  head: () => ({ meta: [{ title: "Nouveau levé — choix de la parcelle" }] }),
+  head: () => ({
+    meta: [
+      { title: "Nouveau levé — parcelle & propriétaire | AcreMap" },
+      { name: "description", content: "Créer une parcelle : localisation administrative, domaine, propriétaire et photos avant la mesure GPS." },
+      { property: "og:title", content: "Nouveau levé — parcelle & propriétaire | AcreMap" },
+      { property: "og:description", content: "Identifiez la parcelle et son propriétaire avant de lancer la mesure GPS." },
+      { property: "og:type", content: "website" },
+      { name: "twitter:card", content: "summary" },
+    ],
+  }),
 });
 
 type Step = 1 | 2 | 3 | 4;
+
+const uniq = (arr: (string | undefined | null)[]) =>
+  Array.from(new Set(arr.map((v) => (v ?? "").trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b, "fr"));
 
 function NewParcelleWizard() {
   const navigate = useNavigate();
   const [step, setStep] = useState<Step>(1);
 
   // Étape 1 — géographie
-  const [district, setDistrict] = useState(listDistricts()[0] ?? "");
-  const [region, setRegion] = useState(regionsOfDistrict(district)[0] ?? "");
-  const [departement, setDepartement] = useState(departementsOfRegion(region)[0] ?? "");
-  const [spName, setSpName] = useState(spsOfDepartement(departement)[0] ?? "");
+  const [district, setDistrict] = useState("");
+  const [region, setRegion] = useState("");
+  const [departement, setDepartement] = useState("");
+  const [spName, setSpName] = useState("");
 
   // Étape 2 — domaine
-  const [domaineMode, setDomaineMode] = useState<"existing" | "new">("new");
   const [domaineExistingId, setDomaineExistingId] = useState<string>("");
   const [domaineName, setDomaineName] = useState("");
 
   // Étape 3 — parcelle
+  const [parcelleName, setParcelleName] = useState("");
   const [ownerName, setOwnerName] = useState("");
   const [ownerPhone, setOwnerPhone] = useState("");
   const [conventionStatus, setConventionStatus] = useState<"PP" | "AC" | "EN_COURS">("PP");
@@ -55,53 +68,103 @@ function NewParcelleWizard() {
     return { sps, domaines, parcelles };
   }, []);
 
-  // SP existante candidate
+  // Listes déroulantes = référentiel officiel + tout ce qui a déjà été créé
+  const districtOptions = useMemo(
+    () => uniq([...listDistricts(), ...(existing?.sps.map((s) => s.district) ?? [])]),
+    [existing],
+  );
+  const regionOptions = useMemo(
+    () => uniq([
+      ...regionsOfDistrict(district),
+      ...(existing?.sps.filter((s) => !district || s.district === district).map((s) => s.region) ?? []),
+    ]),
+    [existing, district],
+  );
+  const departementOptions = useMemo(
+    () => uniq([
+      ...departementsOfRegion(region),
+      ...(existing?.sps.filter((s) => !region || s.region === region).map((s) => s.departement) ?? []),
+    ]),
+    [existing, region],
+  );
+  const spOptions = useMemo(
+    () => uniq([
+      ...spsOfDepartement(departement),
+      ...(existing?.sps.filter((s) => !departement || s.departement === departement).map((s) => s.name) ?? []),
+    ]),
+    [existing, departement],
+  );
+  const ownerOptions = useMemo(() => uniq(existing?.parcelles.map((p) => p.ownerName) ?? []), [existing]);
+
+  // SP existante candidate (nom identique dans le même département)
   const matchingSp = useMemo(() => {
     if (!existing) return null;
+    const n = spName.trim().toLowerCase();
+    if (!n) return null;
     return existing.sps.find(
-      (s) => s.name.toLowerCase() === spName.trim().toLowerCase()
-        && s.departement === departement && s.region === region && s.district === district
+      (s) => s.name.toLowerCase() === n && (!departement || s.departement === departement),
     ) ?? null;
-  }, [existing, spName, departement, region, district]);
+  }, [existing, spName, departement]);
+
+  // Quand on choisit une SP déjà enregistrée, on remplit la hiérarchie automatiquement
+  function pickSp(v: string) {
+    setSpName(v);
+    const found = existing?.sps.find((s) => s.name.toLowerCase() === v.trim().toLowerCase());
+    if (found) {
+      if (found.district) setDistrict(found.district);
+      if (found.region) setRegion(found.region);
+      if (found.departement) setDepartement(found.departement);
+    }
+  }
 
   const domainesOfSp = useMemo(() => {
-    if (!existing || !matchingSp) return [];
-    return existing.domaines.filter((d) => d.spId === matchingSp.id);
+    if (!existing) return [];
+    if (matchingSp) return existing.domaines.filter((d) => d.spId === matchingSp.id);
+    return existing.domaines;
   }, [existing, matchingSp]);
 
   async function submit() {
     if (!existing) return;
     setError(null);
     if (!spName.trim()) return setError("Renseignez le nom de la sous-préfecture.");
-    if (domaineMode === "new" && !domaineName.trim()) return setError("Renseignez le nom du domaine.");
-    if (domaineMode === "existing" && !domaineExistingId) return setError("Choisissez un domaine existant.");
+    if (!domaineExistingId && !domaineName.trim()) return setError("Sélectionnez ou nommez un domaine.");
     if (!ownerName.trim()) return setError("Renseignez le nom du propriétaire.");
 
     setSaving(true);
     try {
       const d = db();
 
-      // SP — réutilise ou crée
+      // SP — réutilise ou crée (et devient disponible dans les listes)
       let spId = matchingSp?.id;
       if (!spId) {
         const code = nextSequentialCode("SP", existing.sps.map((x) => x.code));
         spId = crypto.randomUUID();
         await d.sps.put({
           id: spId, code, name: spName.trim(),
-          district, region, departement, createdAt: Date.now(),
+          district: district.trim(), region: region.trim(), departement: departement.trim(),
+          createdAt: Date.now(),
         });
+        void syncEntity("sps", spId).catch(() => {});
       }
 
-      // Domaine
+      // Domaine — réutilise ou crée
       let domId: string;
-      if (domaineMode === "existing") {
+      if (domaineExistingId) {
         domId = domaineExistingId;
       } else {
-        const code = nextSequentialCode("DOM", existing.domaines.map((x) => x.code));
-        domId = crypto.randomUUID();
-        await d.domaines.put({
-          id: domId, code, name: domaineName.trim(), spId, createdAt: Date.now(),
-        });
+        const already = existing.domaines.find(
+          (x) => x.spId === spId && x.name.toLowerCase() === domaineName.trim().toLowerCase(),
+        );
+        if (already) {
+          domId = already.id;
+        } else {
+          const code = nextSequentialCode("DOM", existing.domaines.map((x) => x.code));
+          domId = crypto.randomUUID();
+          await d.domaines.put({
+            id: domId, code, name: domaineName.trim(), spId, createdAt: Date.now(),
+          });
+          void syncEntity("domaines", domId).catch(() => {});
+        }
       }
 
       // Parcelle
@@ -110,6 +173,7 @@ function NewParcelleWizard() {
       await d.parcelles.put({
         id: parcId,
         code: parcCode,
+        name: parcelleName.trim() || undefined,
         ownerName: ownerName.trim(),
         ownerPhone: ownerPhone.trim() || undefined,
         domaineId: domId,
@@ -122,18 +186,19 @@ function NewParcelleWizard() {
         parcellePhoto: parcellePhoto || undefined,
         createdAt: Date.now(),
       });
+      void syncEntity("parcelles", parcId).catch(() => {});
 
       feedbackSuccess();
-      navigate({ to: "/app/measure", search: { parcelleId: parcId } as any });
-    } catch (e: any) {
-      setError(e?.message ?? "Erreur lors de l'enregistrement.");
+      navigate({ to: "/app/measure", search: { parcelleId: parcId } as never });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Erreur lors de l'enregistrement.");
     } finally {
       setSaving(false);
     }
   }
 
-  const canNext1 = district && region && departement && spName.trim();
-  const canNext2 = domaineMode === "new" ? !!domaineName.trim() : !!domaineExistingId;
+  const canNext1 = !!spName.trim();
+  const canNext2 = !!domaineExistingId || !!domaineName.trim();
   const canNext3 = !!ownerName.trim();
 
   return (
@@ -142,7 +207,9 @@ function NewParcelleWizard() {
         <Link to="/app/parcelles" className="text-xs text-muted-foreground hover:underline">← Parcelles</Link>
         <h1 className="text-2xl font-bold mt-1">Nouveau levé</h1>
         <p className="text-sm text-muted-foreground">
-          Avant de mesurer, identifiez la parcelle et son propriétaire.
+          Chaque champ est à la fois une liste de ce qui existe déjà et un champ de saisie :
+          sélectionnez une valeur enregistrée, ou tapez une nouvelle valeur — elle sera créée
+          et proposée automatiquement les fois suivantes.
         </p>
       </div>
 
@@ -151,71 +218,76 @@ function NewParcelleWizard() {
       {error && <div className="text-xs bg-destructive/10 text-destructive px-3 py-2 rounded-md">{error}</div>}
 
       {step === 1 && (
-        <Section title="1 · Localisation administrative" hint="Choisissez ou saisissez : District → Région → Département → Sous-Préfecture.">
-          <ComboField label="District" value={district} options={listDistricts()}
-            onChange={(v) => { setDistrict(v); const r = regionsOfDistrict(v); setRegion(r[0] ?? ""); const dp = departementsOfRegion(r[0] ?? ""); setDepartement(dp[0] ?? ""); setSpName(spsOfDepartement(dp[0] ?? "")[0] ?? ""); }} />
-          <ComboField label="Région" value={region} options={regionsOfDistrict(district)}
-            onChange={(v) => { setRegion(v); const dp = departementsOfRegion(v); setDepartement(dp[0] ?? ""); setSpName(spsOfDepartement(dp[0] ?? "")[0] ?? ""); }} />
-          <ComboField label="Département" value={departement} options={departementsOfRegion(region)}
-            onChange={(v) => { setDepartement(v); setSpName(spsOfDepartement(v)[0] ?? ""); }} />
-          <ComboField label="Sous-Préfecture (nom)" value={spName} options={spsOfDepartement(departement)}
-            onChange={setSpName} placeholder="Ex : Daloa-Centre" />
+        <Section title="1 · Localisation administrative" hint="District → Région → Département → Sous-Préfecture.">
+          <ComboField label="District" value={district} options={districtOptions}
+            placeholder="Sélectionner ou saisir un district"
+            onChange={(v) => {
+              setDistrict(v);
+              const r = regionsOfDistrict(v);
+              if (r.length && !r.includes(region)) { setRegion(r[0]); const dp = departementsOfRegion(r[0]); setDepartement(dp[0] ?? ""); }
+            }} />
+          <ComboField label="Région" value={region} options={regionOptions}
+            placeholder="Sélectionner ou saisir une région"
+            onChange={(v) => {
+              setRegion(v);
+              const dp = departementsOfRegion(v);
+              if (dp.length && !dp.includes(departement)) setDepartement(dp[0]);
+            }} />
+          <ComboField label="Département" value={departement} options={departementOptions}
+            placeholder="Sélectionner ou saisir un département"
+            onChange={setDepartement} />
+          <ComboField label="Sous-Préfecture" value={spName} options={spOptions}
+            onChange={pickSp} placeholder="Sélectionner ou saisir (ex : Daloa-Centre)" />
           {matchingSp ? (
             <div className="text-xs bg-success/10 text-success rounded-md px-3 py-2">
-              Sous-préfecture existante : <b>{matchingSp.code} · {matchingSp.name}</b>
+              Sous-préfecture existante réutilisée : <b>{matchingSp.code} · {matchingSp.name}</b>
             </div>
-          ) : (
+          ) : spName.trim() ? (
             <div className="text-xs bg-warn/10 text-warn rounded-md px-3 py-2">
-              Nouvelle sous-préfecture — un code sera créé automatiquement (SP{(existing?.sps.length ?? 0) + 1 < 10 ? "00" : (existing?.sps.length ?? 0) + 1 < 100 ? "0" : ""}{(existing?.sps.length ?? 0) + 1}).
+              Nouvelle sous-préfecture — elle sera créée et disponible dans la liste ensuite.
             </div>
-          )}
+          ) : null}
         </Section>
       )}
 
       {step === 2 && (
-        <Section title="2 · Domaine" hint="Sélectionnez un domaine existant ou créez-en un nouveau.">
-          {matchingSp && domainesOfSp.length > 0 && (
-            <div className="space-y-2">
-              <div className="text-xs uppercase tracking-wider text-muted-foreground">Domaines de {matchingSp.code}</div>
-              <div className="grid gap-1.5">
-                {domainesOfSp.map((d) => (
-                  <label key={d.id} className={`flex items-center gap-2 px-3 py-2 rounded-lg border cursor-pointer ${
-                    domaineMode === "existing" && domaineExistingId === d.id ? "border-primary bg-primary/5" : ""
-                  }`}>
-                    <input type="radio" checked={domaineMode === "existing" && domaineExistingId === d.id}
-                      onChange={() => { setDomaineMode("existing"); setDomaineExistingId(d.id); }} />
-                    <span className="text-sm"><b>{d.code}</b> · {d.name}</span>
-                  </label>
-                ))}
-              </div>
-            </div>
-          )}
-          <label className={`flex items-start gap-2 p-3 rounded-lg border cursor-pointer ${domaineMode === "new" ? "border-primary bg-primary/5" : ""}`}>
-            <input type="radio" checked={domaineMode === "new"} onChange={() => setDomaineMode("new")} className="mt-1" />
-            <div className="flex-1">
-              <div className="text-sm font-medium">Créer un nouveau domaine</div>
-              <input value={domaineName} onChange={(e) => { setDomaineName(e.target.value); setDomaineMode("new"); }}
-                placeholder="Nom du domaine (ex : Plantation Gonaté Nord)"
-                className="mt-2 w-full h-10 px-3 rounded-md border bg-background" />
-            </div>
-          </label>
+        <Section title="2 · Domaine" hint="Choisissez un domaine enregistré ou saisissez-en un nouveau.">
+          <Field label="Domaine existant">
+            <select value={domaineExistingId}
+              onChange={(e) => { setDomaineExistingId(e.target.value); if (e.target.value) setDomaineName(""); }}
+              className="w-full h-11 px-3 rounded-md border bg-background text-sm">
+              <option value="">— Nouveau domaine —</option>
+              {domainesOfSp.map((d) => (
+                <option key={d.id} value={d.id}>{d.code} · {d.name}</option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Ou créer un nouveau domaine">
+            <input value={domaineName}
+              onChange={(e) => { setDomaineName(e.target.value); if (e.target.value) setDomaineExistingId(""); }}
+              placeholder="Nom du domaine (ex : Plantation Gonaté Nord)"
+              className="w-full h-11 px-3 rounded-md border bg-background" />
+          </Field>
         </Section>
       )}
 
       {step === 3 && (
-        <Section title="3 · Parcelle & propriétaire" hint="Informations sur la convention.">
-          <Field label="Nom du propriétaire / famille">
-            <input value={ownerName} onChange={(e) => setOwnerName(e.target.value)}
-              placeholder="Ex : Famille Séri" className="w-full h-10 px-3 rounded-md border bg-background" />
+        <Section title="3 · Parcelle & propriétaire" hint="Nom de la parcelle, propriétaire et convention.">
+          <Field label="Nommer la parcelle">
+            <input value={parcelleName} onChange={(e) => setParcelleName(e.target.value)}
+              placeholder="Ex : Parcelle Bloc A — bas-fond"
+              className="w-full h-11 px-3 rounded-md border bg-background" />
           </Field>
+          <ComboField label="Nom du propriétaire / famille" value={ownerName} options={ownerOptions}
+            placeholder="Sélectionner ou saisir (ex : Famille Séri)" onChange={setOwnerName} />
           <Field label="Téléphone du propriétaire (optionnel)">
             <input value={ownerPhone} onChange={(e) => setOwnerPhone(e.target.value)}
-              placeholder="+225 …" className="w-full h-10 px-3 rounded-md border bg-background" />
+              placeholder="+225 …" className="w-full h-11 px-3 rounded-md border bg-background" />
           </Field>
-          <div className="grid grid-cols-2 gap-2">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
             <Field label="Type de convention">
-              <select value={conventionStatus} onChange={(e) => setConventionStatus(e.target.value as any)}
-                className="w-full h-10 px-3 rounded-md border bg-background">
+              <select value={conventionStatus} onChange={(e) => setConventionStatus(e.target.value as "PP" | "AC" | "EN_COURS")}
+                className="w-full h-11 px-3 rounded-md border bg-background">
                 <option value="PP">Planté-Partagé</option>
                 <option value="AC">Achat / Cession</option>
                 <option value="EN_COURS">En cours</option>
@@ -224,7 +296,7 @@ function NewParcelleWizard() {
             <Field label="Surface déclarée (ha)">
               <input value={declaredArea} onChange={(e) => setDeclaredArea(e.target.value)}
                 type="number" step="0.1" min="0"
-                placeholder="Ex : 5" className="w-full h-10 px-3 rounded-md border bg-background" />
+                placeholder="Ex : 5" className="w-full h-11 px-3 rounded-md border bg-background" />
             </Field>
           </div>
           <Field label="Notes (optionnel)">
@@ -235,28 +307,28 @@ function NewParcelleWizard() {
       )}
 
       {step === 4 && (
-        <Section title="4 · Photos" hint="Photos enregistrées localement (pas d'URL externe).">
+        <Section title="4 · Photos" hint="Photos enregistrées localement puis synchronisées.">
           <PhotoField label="Photo du propriétaire" value={ownerPhoto} onChange={setOwnerPhoto} />
           <PhotoField label="Photo de groupe / famille" value={groupPhoto} onChange={setGroupPhoto} />
           <PhotoField label="Photo de la parcelle" value={parcellePhoto} onChange={setParcellePhoto} />
         </Section>
       )}
 
-      <div className="flex gap-2 pt-2">
+      <div className="flex flex-col sm:flex-row gap-2 pt-2 pb-6">
         {step > 1 && (
           <button onClick={() => setStep((s) => (s - 1) as Step)}
-            className="flex-1 h-11 rounded-lg border font-medium">← Précédent</button>
+            className="flex-1 h-12 rounded-lg border font-medium">← Précédent</button>
         )}
         {step < 4 && (
           <button onClick={() => setStep((s) => (s + 1) as Step)}
             disabled={(step === 1 && !canNext1) || (step === 2 && !canNext2) || (step === 3 && !canNext3)}
-            className="flex-1 h-11 rounded-lg bg-primary text-primary-foreground font-semibold disabled:opacity-40">
+            className="flex-1 h-12 rounded-lg bg-primary text-primary-foreground font-semibold disabled:opacity-40">
             Suivant →
           </button>
         )}
         {step === 4 && (
           <button onClick={submit} disabled={saving}
-            className="flex-1 h-11 rounded-lg bg-primary text-primary-foreground font-semibold disabled:opacity-40">
+            className="flex-1 h-12 rounded-lg bg-primary text-primary-foreground font-semibold disabled:opacity-40">
             {saving ? "Enregistrement…" : "Enregistrer & lancer la mesure GPS"}
           </button>
         )}
@@ -289,7 +361,7 @@ function Stepper({ step }: { step: number }) {
 
 function Section({ title, hint, children }: { title: string; hint?: string; children: React.ReactNode }) {
   return (
-    <section className="bg-card rounded-2xl shadow-card p-5 space-y-3">
+    <section className="bg-card rounded-2xl shadow-card p-4 sm:p-5 space-y-3">
       <div>
         <h2 className="font-semibold">{title}</h2>
         {hint && <p className="text-xs text-muted-foreground mt-0.5">{hint}</p>}
@@ -308,13 +380,27 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-function ComboField({ label, value, options, onChange, placeholder }: { label: string; value: string; options: string[]; onChange: (v: string) => void; placeholder?: string }) {
+/** Champ hybride : liste déroulante des valeurs déjà enregistrées + saisie libre (recherche / création). */
+function ComboField({ label, value, options, onChange, placeholder }: {
+  label: string; value: string; options: string[]; onChange: (v: string) => void; placeholder?: string;
+}) {
   const id = `dl-${label.replace(/\W/g, "-")}`;
+  const isNew = !!value.trim() && !options.some((o) => o.toLowerCase() === value.trim().toLowerCase());
   return (
     <Field label={label}>
-      <input value={value} onChange={(e) => onChange(e.target.value)} list={id} placeholder={placeholder}
-        className="w-full h-10 px-3 rounded-md border bg-background" />
+      <div className="flex flex-col sm:flex-row gap-2">
+        <select
+          value={options.includes(value) ? value : ""}
+          onChange={(e) => e.target.value && onChange(e.target.value)}
+          className="sm:w-1/2 h-11 px-2 rounded-md border bg-background text-sm">
+          <option value="">— Choisir —</option>
+          {options.map((o) => <option key={o} value={o}>{o}</option>)}
+        </select>
+        <input value={value} onChange={(e) => onChange(e.target.value)} list={id} placeholder={placeholder}
+          className="sm:w-1/2 h-11 px-3 rounded-md border bg-background text-sm" />
+      </div>
       <datalist id={id}>{options.map((o) => <option key={o} value={o} />)}</datalist>
+      {isNew && <div className="text-[10px] text-warn mt-1">Nouvelle valeur — elle sera enregistrée.</div>}
     </Field>
   );
 }
@@ -330,8 +416,8 @@ function PhotoField({ label, value, onChange }: { label: string; value: string; 
     <div className="space-y-2">
       <div className="text-xs text-muted-foreground">{label}</div>
       <div className="flex items-center gap-3">
-        <div className="w-20 h-20 rounded-lg bg-muted overflow-hidden border flex items-center justify-center text-xs text-muted-foreground">
-          {value ? <img src={value} alt="" className="w-full h-full object-cover" /> : "Aucune"}
+        <div className="w-20 h-20 rounded-lg bg-muted overflow-hidden border flex items-center justify-center text-xs text-muted-foreground shrink-0">
+          {value ? <img src={value} alt={label} className="w-full h-full object-cover" /> : "Aucune"}
         </div>
         <div className="flex-1 flex flex-col gap-1.5">
           <label className="cursor-pointer text-xs px-3 py-2 rounded-md border bg-background text-center hover:bg-muted">
