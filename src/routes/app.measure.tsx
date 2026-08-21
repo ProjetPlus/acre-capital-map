@@ -40,7 +40,10 @@ function MeasurePage() {
     return db().parcelles.get(parcelleId);
   }, [parcelleId]);
 
+  // `running` = GPS actif (interface ouverte, position affichée)
+  // `started` = levée réellement démarrée (le tracé n'avance qu'à partir de là)
   const [running, setRunning] = useState(false);
+  const [started, setStarted] = useState(false);
   const [paused, setPaused] = useState(false);
   const [satellite, setSatellite] = useState(true);
   const [unit, setUnit] = useState<"ha" | "m2" | "km2">("ha");
@@ -75,10 +78,12 @@ function MeasurePage() {
   const stablePosRef = useRef<GpsPoint | null>(null);
   const watchRef = useRef<{ stop: () => void } | null>(null);
   const pausedRef = useRef(false);
+  const startedRef = useRef(false);
   const cfgRef = useRef<GpsConfig>(DEFAULT_GPS_CONFIG);
   const wakeRef = useRef<{ release: () => void } | null>(null);
   useEffect(() => () => { wakeRef.current?.release(); }, []);
   useEffect(() => { pausedRef.current = paused; }, [paused]);
+  useEffect(() => { startedRef.current = started; }, [started]);
   useEffect(() => { cfgRef.current = gpsConfig; }, [gpsConfig]);
 
   useEffect(() => {
@@ -96,6 +101,11 @@ function MeasurePage() {
         setRejectedCount((c) => c + 1);
       }
       setQaHistory((h) => [...h.slice(-29), { ts: raw.ts, acc: raw.accuracy, ok: accepted }]);
+      // La position affichée est toujours rafraîchie (pour pouvoir marquer le
+      // départ), mais aucun tracé n'est construit tant que la levée n'a pas
+      // été démarrée par l'opérateur.
+      if (accepted) setFilteredCur(filtered);
+      if (!startedRef.current) return;
       if (pausedRef.current) return;
       if (!accepted) return;
 
@@ -168,12 +178,15 @@ function MeasurePage() {
     }
   }
 
-  async function startGps() {
+  /** Ouvre simplement l'interface de levée : GPS actif, mais AUCUN tracé. */
+  async function openSurvey() {
     await unlockAudio();
     await requestNotificationPermission();
     stablePosRef.current = null;
     lastAutoRef.current = null;
     setTrace([]);
+    setPoints([]);
+    setStarted(false);
     setFilteredCur(null);
     setRunning(true);
     // Garde l'écran allumé pendant le levé (continuité du tracé)
@@ -225,6 +238,7 @@ function MeasurePage() {
       setError(`Précision insuffisante (±${src.accuracy.toFixed(0)} m, seuil calibré ${gpsConfig.maxAcceptableAccuracy} m). Attendez un meilleur signal.`);
       return;
     }
+    const isStart = !started;
     const p: MeasurementPoint = {
       index: points.length + 1,
       samples: 1,
@@ -234,7 +248,16 @@ function MeasurePage() {
       accuracy: src.accuracy,
       ts: Date.now(),
     };
-    setPoints((s) => [...s, p]);
+    if (isStart) {
+      // MARQUER LE DÉPART — c'est ce clic qui démarre réellement la levée.
+      stablePosRef.current = { lat: src.lat, lng: src.lng, accuracy: src.accuracy, ts: p.ts };
+      setTrace([{ lat: src.lat, lng: src.lng, accuracy: src.accuracy, ts: p.ts }]);
+      setPoints([p]);
+      setStarted(true);
+      notify("Levée démarrée", "Point de départ enregistré. Marchez autour de la parcelle.", { tag: "start" });
+    } else {
+      setPoints((s) => [...s, p]);
+    }
     lastAutoRef.current = { lat: p.lat, lng: p.lng, accuracy: p.accuracy, ts: p.ts };
     feedbackMark();
   }
@@ -257,20 +280,47 @@ function MeasurePage() {
     if (!res.ok) feedbackError();
   }
 
-  async function save(submit: boolean) {
+  /**
+   * Enregistre la levée. `force` permet de terminer à tout moment après le
+   * démarrage : le polygone est refermé automatiquement sur le point de départ
+   * à partir de la position actuelle.
+   */
+  async function save(submit: boolean, force = false) {
     if (!user) return;
     if (!isBrowser()) return;
-    const check = validateFieldMeasurement(points, {
+    // Fermeture automatique : la position courante est ajoutée comme dernier
+    // point si l'opérateur n'est pas revenu au point de départ.
+    const src = filteredCur ?? current;
+    let finalPoints = points;
+    if (force && src && points.length >= 1) {
+      const last = points[points.length - 1];
+      if (haversine(last, src) > 5) {
+        finalPoints = [...points, {
+          index: points.length + 1, samples: 1, auto: true,
+          lat: src.lat, lng: src.lng, accuracy: src.accuracy, ts: Date.now(),
+        }];
+      }
+    }
+    if (finalPoints.length < 3) {
+      feedbackError();
+      setError("Au moins 3 points sont nécessaires pour former une parcelle.");
+      return;
+    }
+    const finalTrace = force && finalPoints.length
+      ? [...trace, { lat: finalPoints[0].lat, lng: finalPoints[0].lng, accuracy: finalPoints[0].accuracy, ts: Date.now() }]
+      : trace;
+    const check = validateFieldMeasurement(finalPoints, {
       maxAcceptableAccuracyM: gpsConfig.maxAcceptableAccuracy,
       calibration,
       acceptedSamples: acceptedCount,
     });
-    if (!check.ok) {
+    if (!check.ok && !force) {
       setFieldCheck(check);
       setCheckOpen(true);
       feedbackError();
       return;
     }
+    const points_ = finalPoints;
     const accVals = accSamples.filter((a) => a < 999).sort((a, b) => a - b);
     const median = accVals[Math.floor(accVals.length / 2)] ?? bestAcc;
     const m: Measurement = {
@@ -279,7 +329,7 @@ function MeasurePage() {
       createdBy: user.id,
       createdAt: Date.now(),
       status: submit ? "submitted" : "draft",
-      points, trace,
+      points: points_, trace: finalTrace,
       areaM2: polygonAreaM2(points),
       perimeterM: polygonPerimeterM(points),
       unit,
