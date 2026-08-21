@@ -330,8 +330,8 @@ function MeasurePage() {
       createdAt: Date.now(),
       status: submit ? "submitted" : "draft",
       points: points_, trace: finalTrace,
-      areaM2: polygonAreaM2(points),
-      perimeterM: polygonPerimeterM(points),
+      areaM2: polygonAreaM2(points_),
+      perimeterM: polygonPerimeterM(points_),
       unit,
       deviceProfile: {
         userAgent: navigator.userAgent, platform: navigator.platform,
@@ -368,6 +368,8 @@ function MeasurePage() {
       },
     };
     await db().measurements.put(m);
+    // Synchronisation cloud immédiate (ou mise en file d'attente hors ligne)
+    void syncEntity("measurements", m.id).catch(() => {});
     feedbackSuccess();
     setCheckOpen(false);
     if (submit) await notify("Mesure soumise", `Levé envoyé (${formatArea(m.areaM2, m.unit)}).`, { tag: "submit" });
